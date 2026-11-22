@@ -11,11 +11,15 @@ The goal is cleaned day and night LST maps in degrees Celsius, exported as
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import numpy as np
 import xarray as xr
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -124,3 +128,63 @@ def get_product(name: str) -> ModisProduct:
         if product.short_name.lower() == key:
             return product
     raise ValueError(f"Unknown MODIS product: {name!r}")
+
+
+# ---------------------------------------------------------------------------
+# Download
+# ---------------------------------------------------------------------------
+
+BoundingBox = tuple[float, float, float, float]  # (west, south, east, north)
+
+
+def download_granules(
+    product: ModisProduct,
+    bbox: BoundingBox,
+    start: date | str,
+    end: date | str,
+    out_dir: Path | str | None = None,
+    login_strategy: str = "netrc",
+) -> list[Path]:
+    """Search and download MODIS LST granules from NASA Earthdata.
+
+    Parameters
+    ----------
+    product:
+        ``TERRA`` or ``AQUA`` (each is downloaded into its own directory).
+    bbox:
+        Area of interest as ``(west, south, east, north)`` in degrees.
+    start, end:
+        Inclusive date range, as ``datetime.date`` or ``"YYYY-MM-DD"``.
+    out_dir:
+        Target directory; defaults to ``product.raw_dir``.
+    login_strategy:
+        ``earthaccess`` login strategy: ``"netrc"`` (``~/.netrc`` or
+        ``~/_netrc``), ``"environment"`` (``EARTHDATA_USERNAME`` /
+        ``EARTHDATA_PASSWORD``) or ``"interactive"``.
+
+    Returns
+    -------
+    list[Path]
+        Sorted paths of the local HDF files (already present files are reused).
+    """
+    import earthaccess  # imported lazily: only needed for downloading
+
+    out_dir = Path(out_dir) if out_dir is not None else product.raw_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    auth = earthaccess.login(strategy=login_strategy)
+    if not auth or not auth.authenticated:
+        raise RuntimeError("Earthdata login failed - check your credentials.")
+
+    results = earthaccess.search_data(
+        short_name=product.short_name,
+        version=product.version,
+        bounding_box=tuple(bbox),
+        temporal=(str(start), str(end)),
+    )
+    logger.info("%s: found %d granules for %s..%s", product, len(results), start, end)
+    if not results:
+        return []
+
+    files = earthaccess.download(results, local_path=str(out_dir))
+    return sorted(Path(f) for f in files)
