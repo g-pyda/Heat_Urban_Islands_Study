@@ -451,3 +451,206 @@ def mask_granule(
         qc_allow_other_quality=int(allow_other_quality),
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Unit conversion
+# ---------------------------------------------------------------------------
+
+
+def dn_to_celsius(dn: xr.DataArray) -> xr.DataArray:
+    """Convert LST digital numbers to degrees Celsius.
+
+    ``Ts [degC] = 0.02 * DN - 273.15``
+
+    Fill values (``DN == 0``) and values outside the valid range are returned
+    as NaN, so the conversion is safe on raw as well as QC-masked input
+    (a fill of 0 would otherwise become -273.15 degC).
+    """
+    lo, hi = LST_VALID_RANGE
+    valid = (dn >= lo) & (dn <= hi)
+    celsius = (dn.astype(np.float32) * np.float32(LST_SCALE)
+               - np.float32(KELVIN_OFFSET)).where(valid)
+    celsius.attrs = {
+        "long_name": dn.attrs.get("long_name", dn.name or "land surface temperature"),
+        "standard_name": "surface_temperature",
+        "units": "degC",
+    }
+    return celsius
+
+
+def view_time_to_hours(vt: xr.DataArray) -> xr.DataArray:
+    """Convert view-time digital numbers to local solar time in hours.
+
+    ``t [h] = 0.1 * DN``; the fill value 255 and values outside 0-240 become
+    NaN.
+    """
+    lo, hi = VIEW_TIME_VALID_RANGE
+    valid = (vt >= lo) & (vt <= hi) & (vt != VIEW_TIME_FILL)
+    hours = (vt.astype(np.float32) * np.float32(VIEW_TIME_SCALE)).where(valid)
+    hours.attrs = {
+        "long_name": vt.attrs.get("long_name", "local solar time of observation"),
+        "units": "hours",
+        "comment": "local solar time (0-24 h)",
+    }
+    return hours
+
+
+def convert_granule(ds: xr.Dataset) -> xr.Dataset:
+    """Convert LST layers to degC and view-time layers to hours.
+
+    Works on the output of :func:`load_lst_layers` or :func:`mask_granule`;
+    QC layers (if present) are left untouched.
+    """
+    out = ds.copy()
+    for name in (LST_DAY, LST_NIGHT):
+        if name in out:
+            out[name] = dn_to_celsius(ds[name])
+    for name in (VIEW_TIME_DAY, VIEW_TIME_NIGHT):
+        if name in out:
+            out[name] = view_time_to_hours(ds[name])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Pipeline and export
+# ---------------------------------------------------------------------------
+
+OUTPUT_NAMES = {
+    LST_DAY: "lst_day",
+    LST_NIGHT: "lst_night",
+    VIEW_TIME_DAY: "view_time_day",
+    VIEW_TIME_NIGHT: "view_time_night",
+}
+
+# Per-granule attributes that would conflict when stacking/mosaicking
+_GRANULE_ATTRS = ("tile", "source_file")
+
+
+def process_granule(
+    path: Path | str,
+    product: ModisProduct,
+    max_lst_error: float | None = 2.0,
+    allow_other_quality: bool = True,
+) -> xr.Dataset:
+    """Load, QC-mask and convert one granule.
+
+    Returns a Dataset with ``lst_day``/``lst_night`` [degC] and
+    ``view_time_day``/``view_time_night`` [h local solar time] on the
+    sinusoidal ``(y, x)`` grid; QC layers are dropped.
+    """
+    ds = load_lst_layers(path, product)
+    ds = mask_granule(ds, max_lst_error, allow_other_quality)
+    ds = convert_granule(ds)
+    ds = ds.drop_vars([QC_DAY, QC_NIGHT]).rename(OUTPUT_NAMES)
+    for key in list(ds.attrs):
+        if key.startswith("valid_fraction_") or key in _GRANULE_ATTRS:
+            del ds.attrs[key]
+    return ds
+
+
+def process_product(
+    product: ModisProduct,
+    paths: list[Path | str],
+    max_lst_error: float | None = 2.0,
+    allow_other_quality: bool = True,
+) -> xr.Dataset:
+    """Process all granules of one product into a ``(time, y, x)`` Dataset.
+
+    Granules from the same day (neighbouring tiles) are mosaicked, then days
+    are stacked along ``time``. Only granules of ``product`` are accepted,
+    so Terra and Aqua always end up in separate datasets.
+    """
+    if not paths:
+        raise ValueError(f"No granules given for {product}")
+
+    by_day: dict[datetime, list[xr.Dataset]] = {}
+    for path in sorted(paths):
+        day = parse_granule_name(path)["date"]
+        logger.info("%s: processing %s", product, Path(path).name)
+        by_day.setdefault(day, []).append(
+            process_granule(path, product, max_lst_error, allow_other_quality)
+        )
+
+    daily = [
+        tiles[0] if len(tiles) == 1
+        else xr.combine_by_coords(tiles, combine_attrs="drop_conflicts")
+        for _, tiles in sorted(by_day.items())
+    ]
+    ds = xr.concat(daily, dim="time", combine_attrs="drop_conflicts")
+
+    for part in ("day", "night"):
+        ds[f"valid_fraction_{part}"] = ds[f"lst_{part}"].notnull().mean(("y", "x"))
+        ds[f"valid_fraction_{part}"].attrs = {
+            "long_name": f"fraction of {part} pixels passing QC",
+            "units": "1",
+        }
+
+    ds.attrs.update(
+        title=f"Cleaned daily {product.short_name} LST ({product.platform})",
+        product=product.short_name,
+        platform=product.platform,
+        history=f"{datetime.now():%Y-%m-%d %H:%M} processed with modis_processing.py",
+    )
+    return ds
+
+
+def export(ds: xr.Dataset, path: Path | str | None = None) -> Path:
+    """Write a processed dataset to compressed NetCDF.
+
+    Defaults to ``data/processed/<short_name>_lst.nc`` based on the
+    ``product`` attribute. Reload with ``xr.open_dataset(path)``.
+    """
+    if path is None:
+        path = get_product(ds.attrs["product"]).processed_path
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    encoding = {
+        name: {"zlib": True, "complevel": 4, "dtype": "float32"}
+        for name in ds.data_vars
+    }
+    ds.to_netcdf(path, encoding=encoding)
+    logger.info("Saved %s", path)
+    return path
+
+
+def run(
+    product: ModisProduct,
+    bbox: BoundingBox,
+    start: date | str,
+    end: date | str,
+    max_lst_error: float | None = 2.0,
+    allow_other_quality: bool = True,
+) -> xr.Dataset:
+    """Download, process and export one product end to end."""
+    paths = download_granules(product, bbox, start, end)
+    ds = process_product(product, paths, max_lst_error, allow_other_quality)
+    export(ds)
+    return ds
+
+
+def _parse_args(argv: list[str] | None = None):
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Download and clean daily MODIS LST (MOD11A1/MYD11A1)."
+    )
+    parser.add_argument("--satellite", choices=["terra", "aqua", "both"], default="both")
+    parser.add_argument("--bbox", type=float, nargs=4, required=True,
+                        metavar=("WEST", "SOUTH", "EAST", "NORTH"))
+    parser.add_argument("--start", required=True, help="YYYY-MM-DD")
+    parser.add_argument("--end", required=True, help="YYYY-MM-DD")
+    parser.add_argument("--max-lst-error", type=float, choices=[1, 2, 3], default=2)
+    parser.add_argument("--strict", action="store_true",
+                        help="keep only mandatory QA = 00 (good quality) pixels")
+    return parser.parse_args(argv)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    args = _parse_args()
+    products = [TERRA, AQUA] if args.satellite == "both" else [get_product(args.satellite)]
+    for prod in products:
+        run(prod, tuple(args.bbox), args.start, args.end,
+            max_lst_error=args.max_lst_error, allow_other_quality=not args.strict)
