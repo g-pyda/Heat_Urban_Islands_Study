@@ -283,3 +283,63 @@ def test_class_diurnal_difference_is_paired_by_default():
     assert float(paired["d"].isel(time=0, clc_class=0)) == pytest.approx(expected)
     assert float(unpaired["d"].isel(time=0, clc_class=0)) > expected
     assert int(paired["n_valid_day"].isel(time=0, clc_class=0)) == 2 * NY
+
+
+# ---------------------------------------------------------------------------
+# Statistical summary
+# ---------------------------------------------------------------------------
+
+
+def test_select_dates():
+    lst = make_lst()
+    assert s.select_dates(lst).sizes["time"] == 3
+    assert s.select_dates(lst, "2025-07-02").sizes["time"] == 1
+    sub = s.select_dates(lst, ["2025-07-03", pd.Timestamp("2025-07-01")])
+    assert list(sub.time.values) == [DATES[0], DATES[2]]
+    assert s.select_dates(lst, slice("2025-07-02", None)).sizes["time"] == 2
+    with pytest.raises(KeyError):
+        s.select_dates(lst, ["2025-08-01"])
+
+
+def test_suhi_summary_columns_and_values():
+    df = s.suhi_summary(make_lst(), make_masks(), make_fractions(),
+                        classes=(111, 211))
+    assert isinstance(df, pd.DataFrame)
+    assert df.index.name == "date" and len(df) == 3
+    assert list(df.columns) == [
+        "T_u_day", "T_r_day", "T_u_night", "T_r_night",
+        "SUHI_day", "SUHI_night", "D_SUHI",
+        "valid_u_day", "valid_r_day", "valid_u_night", "valid_r_night",
+        "D_111", "D_211",
+    ]
+    row = df.iloc[0]
+    assert row["T_u_day"] == pytest.approx(T["urban"]["day"])
+    assert row["SUHI_day"] == pytest.approx(4.0)
+    assert row["SUHI_night"] == pytest.approx(7.0)
+    assert row["D_SUHI"] == pytest.approx(-3.0)
+    assert row["D_111"] == pytest.approx(13.0)
+    assert row["D_211"] == pytest.approx(16.0)
+    assert df.attrs["platform"] == "Terra"
+    assert df.attrs["n_urban_pixels"] == 3 * NY
+    assert df.attrs["clc_names"][111] == "Continuous urban fabric"
+
+
+def test_suhi_summary_selected_dates_without_classes():
+    lst = make_lst(pad=0)
+    lst["lst_night"][2] = np.nan                     # cloudy last night
+    df = s.suhi_summary(lst, make_masks(), dates=["2025-07-01", "2025-07-03"])
+    assert list(df.index) == [DATES[0], DATES[2]]
+    assert not any(c.startswith("D_1") for c in df.columns)
+    assert np.isnan(df.loc[DATES[2], "D_SUHI"])
+    assert df.loc[DATES[2], "valid_u_night"] == 0.0
+
+
+def test_describe_summary():
+    lst = make_lst(pad=0)
+    lst["lst_night"][2] = np.nan
+    stats = s.describe_summary(s.suhi_summary(lst, make_masks()))
+    assert list(stats.columns) == ["count", "mean", "std", "min", "median", "max"]
+    assert stats.loc["SUHI_day", "count"] == 3
+    assert stats.loc["D_SUHI", "count"] == 2
+    assert stats.loc["SUHI_night", "mean"] == pytest.approx(7.0)
+    assert stats.attrs["platform"] == "Terra"

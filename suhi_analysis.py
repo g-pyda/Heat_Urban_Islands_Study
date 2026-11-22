@@ -13,6 +13,9 @@ For every observation date the module computes
 * the SUHI intensity ``dT_SUHI = T_u - T_r`` for day and night,
 * the day-night difference of the SUHI ``D_SUHI = dT_SUHI^day - dT_SUHI^night``,
 * day-night LST differences of CORINE classes ``D_c = T_c^day - T_c^night``.
+
+:func:`suhi_summary` collects all of these in a ``pandas.DataFrame`` (one
+row per date), :func:`describe_summary` aggregates it over the dates.
 """
 
 from __future__ import annotations
@@ -324,3 +327,125 @@ def class_diurnal_difference(
         logger.warning("No MODIS pixel with >= %.0f %% of class(es) %s",
                        100 * min_fraction, empty)
     return ds
+
+
+# ---------------------------------------------------------------------------
+# Statistical summary
+# ---------------------------------------------------------------------------
+
+
+def select_dates(lst: xr.Dataset, dates=None) -> xr.Dataset:
+    """Restrict ``lst`` to the given observation dates (default: all).
+
+    ``dates`` are strings (``"YYYY-MM-DD"``), ``date``/``datetime`` objects
+    or a ``slice`` of them. Missing dates raise ``KeyError``.
+    """
+    lst = _ensure_time(lst)
+    if dates is None:
+        return lst
+    if isinstance(dates, slice):
+        return lst.sel(time=dates)
+    if isinstance(dates, (str, pd.Timestamp)) or not np.iterable(dates):
+        dates = [dates]
+    wanted = pd.DatetimeIndex(pd.to_datetime(list(dates))).normalize()
+    have = pd.DatetimeIndex(lst["time"].values).normalize()
+    missing = wanted.difference(have)
+    if len(missing):
+        raise KeyError(f"Dates not in LST data: {[d.date() for d in missing]}")
+    return lst.isel(time=np.flatnonzero(have.isin(wanted)))
+
+
+def suhi_summary(
+    lst: xr.Dataset,
+    masks: xr.Dataset,
+    fractions: xr.Dataset | None = None,
+    dates=None,
+    classes: tuple[int, ...] | None = None,
+    min_valid_fraction: float = DEFAULT_MIN_VALID_FRACTION,
+    paired: bool = False,
+    **class_kwargs,
+) -> pd.DataFrame:
+    """Per-date summary of SUHI intensity and diurnal differences.
+
+    Parameters
+    ----------
+    lst:
+        Processed LST of one product (Terra or Aqua, never mixed).
+    masks:
+        Urban / rural masks from :func:`corine_utils.modis_urban_rural_masks`.
+    fractions:
+        Optional output of :func:`corine_utils.class_fractions`; adds the
+        per-class differences ``D_<code>``.
+    dates:
+        Observation dates to include (see :func:`select_dates`).
+    classes:
+        CLC codes for the class differences (default: all in ``fractions``).
+    min_valid_fraction, paired:
+        Passed to :func:`urban_rural_lst` for the SUHI part.
+    class_kwargs:
+        Passed to :func:`class_diurnal_difference` (``min_fraction``,
+        ``min_coverage``, ``paired``; ``min_valid_fraction`` is shared).
+
+    Returns
+    -------
+    DataFrame indexed by ``date`` with columns
+
+    * ``T_u_day``, ``T_r_day``, ``T_u_night``, ``T_r_night`` [degC],
+    * ``SUHI_day``, ``SUHI_night`` (``dT_SUHI``) and ``D_SUHI`` [degC],
+    * ``valid_u_day`` ... ``valid_r_night`` - cloud-free share of each zone,
+    * ``D_<code>`` - ``D_c`` of every CLC class (if ``fractions`` given).
+
+    ``df.attrs`` holds the platform/product and the zone sizes. Use
+    :func:`describe_summary` for statistics over the dates.
+    """
+    lst = select_dates(lst, dates)
+    stats = urban_rural_lst(lst, masks, min_valid_fraction, paired)
+    suhi = suhi_intensity(stats)
+
+    cols: dict[str, xr.DataArray] = {}
+    for period in PERIODS:
+        for zone, short in (("urban", "u"), ("rural", "r")):
+            cols[f"T_{short}_{period}"] = stats["mean"].sel(zone=zone, period=period)
+    for period in PERIODS:
+        cols[f"SUHI_{period}"] = suhi.sel(period=period)
+    cols["D_SUHI"] = diurnal_suhi_difference(suhi)
+    for period in PERIODS:
+        for zone, short in (("urban", "u"), ("rural", "r")):
+            cols[f"valid_{short}_{period}"] = stats["valid_fraction"].sel(
+                zone=zone, period=period)
+
+    attrs = {
+        **stats.attrs,
+        "n_urban_pixels": int(stats["n_pixels"].sel(zone="urban")),
+        "n_rural_pixels": int(stats["n_pixels"].sel(zone="rural")),
+    }
+    if fractions is not None:
+        cls = class_diurnal_difference(lst, fractions, classes,
+                                       min_valid_fraction=min_valid_fraction,
+                                       **class_kwargs)
+        for code in cls["clc_class"].values:
+            cols[f"D_{int(code)}"] = cls["d"].sel(clc_class=code)
+        attrs["clc_names"] = {int(k): str(n) for k, n in
+                              zip(cls["clc_class"].values, cls["clc_name"].values)}
+        attrs["n_class_pixels"] = {int(k): int(n) for k, n in
+                                   zip(cls["clc_class"].values, cls["n_pixels"].values)}
+
+    index = pd.DatetimeIndex(lst["time"].values, name="date") \
+        if np.issubdtype(lst["time"].dtype, np.datetime64) \
+        else pd.Index(lst["time"].values, name="date")
+    df = pd.DataFrame({k: np.asarray(v.values, float) for k, v in cols.items()},
+                      index=index)
+    df.attrs = attrs
+    return df
+
+
+def describe_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Statistics over dates (count, mean, std, min, median, max) per column.
+
+    ``count`` is the number of dates with a valid value, so cloud-covered
+    dates are visible. Each column of ``df`` becomes one row of the result.
+    """
+    stats = df.agg(["count", "mean", "std", "min", "median", "max"]).T
+    stats["count"] = stats["count"].astype(int)
+    stats.attrs = dict(df.attrs)
+    return stats
