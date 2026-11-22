@@ -221,3 +221,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# MODIS data (raw HDF granules and processed outputs)
+data/
