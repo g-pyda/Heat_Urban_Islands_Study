@@ -10,7 +10,8 @@ For every observation date the module computes
 
 * the mean surface temperature of the urban (``T_u``) and rural reference
   (``T_r``) pixels, separately for day and night,
-* the SUHI intensity ``dT_SUHI = T_u - T_r`` for day and night.
+* the SUHI intensity ``dT_SUHI = T_u - T_r`` for day and night,
+* the day-night difference of the SUHI ``D_SUHI = dT_SUHI^day - dT_SUHI^night``.
 """
 
 from __future__ import annotations
@@ -182,6 +183,16 @@ def urban_rural_lst(
 # ---------------------------------------------------------------------------
 
 
+def day_minus_night(da: xr.DataArray) -> xr.DataArray:
+    """``da(period="day") - da(period="night")``, dropping ``period``.
+
+    NaN on dates where either period is missing.
+    """
+    if "period" not in da.dims:
+        raise ValueError("Expected a 'period' dimension")
+    return da.sel(period="day", drop=True) - da.sel(period="night", drop=True)
+
+
 def suhi_intensity(
     stats: xr.Dataset,
     urban: object = "urban",
@@ -203,3 +214,17 @@ def suhi_intensity(
     suhi.attrs = {"units": "degC",
                   "long_name": "surface urban heat island intensity (T_u - T_r)"}
     return suhi
+
+
+def diurnal_suhi_difference(suhi: xr.DataArray) -> xr.DataArray:
+    """Day-night SUHI difference ``D_SUHI = dT_SUHI^day - dT_SUHI^night``.
+
+    ``suhi`` is the output of :func:`suhi_intensity`. Positive values mean
+    a stronger heat island by day (typical for summer surface UHIs),
+    negative values a stronger one at night. Returns a ``(time,)`` array.
+    """
+    d = day_minus_night(suhi)
+    d.name = "d_suhi"
+    d.attrs = {"units": "degC",
+               "long_name": "day-night difference of SUHI intensity"}
+    return d

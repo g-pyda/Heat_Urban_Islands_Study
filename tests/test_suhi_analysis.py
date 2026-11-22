@@ -182,3 +182,29 @@ def test_suhi_intensity_custom_zone_names():
     np.testing.assert_allclose(suhi.sel(period="day"), 4.0)
     with pytest.raises(ValueError):
         s.suhi_intensity(stats)
+
+
+# ---------------------------------------------------------------------------
+# Day-night difference of the SUHI
+# ---------------------------------------------------------------------------
+
+
+def test_diurnal_suhi_difference():
+    suhi = s.suhi_intensity(s.urban_rural_lst(make_lst(), make_masks()))
+    d = s.diurnal_suhi_difference(suhi)
+    assert d.name == "d_suhi" and d.dims == ("time",)
+    expected = ((T["urban"]["day"] - T["rural"]["day"])
+                - (T["urban"]["night"] - T["rural"]["night"]))
+    np.testing.assert_allclose(d, expected)  # 4 - 7 = -3: stronger at night
+
+
+def test_diurnal_suhi_difference_nan_without_night():
+    lst = make_lst(pad=0)
+    lst["lst_night"][2] = np.nan
+    d = s.diurnal_suhi_difference(s.suhi_intensity(s.urban_rural_lst(lst, make_masks())))
+    assert np.isfinite(d[:2]).all() and np.isnan(d[2])
+
+
+def test_day_minus_night_requires_period():
+    with pytest.raises(ValueError):
+        s.day_minus_night(xr.DataArray([1.0], dims="time"))
