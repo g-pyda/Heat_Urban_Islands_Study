@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import numpy as np
+import xarray as xr
 import pytest
 
 import corine_utils as c
@@ -209,3 +210,161 @@ def test_class_shares(clc):
     assert sum(shares.values()) == pytest.approx(1.0)
     assert set(shares) == {111, 112, 121, 211, 311}
     assert shares[211] > shares[311] > 0
+
+
+# ---------------------------------------------------------------------------
+# Urban core and rural reference masks
+# ---------------------------------------------------------------------------
+
+VILLAGE = (slice(195, 206), slice(45, 56))     # 121 px, ~15 km west
+SPECK = (slice(290, 293), slice(199, 202))     # 9 px, ~9 km south
+
+
+@pytest.fixture
+def clc_settl(tmp_path):
+    """Synthetic raster with a village and a tiny built-up speck."""
+    g = synthetic_grid()
+    g[VILLAGE] = grid_code(112)
+    g[SPECK] = grid_code(121)
+    return c.load_corine(write_clc(tmp_path / "s.tif", g, nodata=128), bbox=None)
+
+
+def dist_from_centre(clc):
+    return c.distance_from_point(clc).values
+
+
+def pixel_lon(clc):
+    """Longitude of every pixel centre (meridians are tilted in LAEA)."""
+    xx, yy = np.meshgrid(clc.x.values, clc.y.values)
+    lon, _ = Transformer.from_crs(c.CORINE_CRS, "EPSG:4326",
+                                  always_xy=True).transform(xx, yy)
+    return lon
+
+
+def test_distance_to_single_pixel(clc):
+    mask = clc.copy(data=np.zeros(clc.shape, bool))
+    mask.values[100, 100] = True
+    d = c.distance_to(mask)
+    assert d.attrs["units"] == "m"
+    assert d.values[100, 100] == 0
+    assert d.values[100, 103] == pytest.approx(300)
+    assert d.values[104, 103] == pytest.approx(500)
+
+
+def test_distance_to_empty_mask_is_inf(clc):
+    mask = clc.copy(data=np.zeros(clc.shape, bool))
+    assert np.isinf(c.distance_to(mask).values).all()
+
+
+def test_distance_from_point_centre(clc):
+    d = dist_from_centre(clc)
+    assert d.min() < RES
+    assert d[0, 0] > 25_000
+
+
+def test_polygon_mask_projected_square(clc):
+    x0, y0 = float(clc.x[10]) - RES / 2, float(clc.y[29]) - RES / 2
+    square = {"type": "Polygon", "coordinates": [[
+        (x0, y0), (x0 + 2000, y0), (x0 + 2000, y0 + 2000),
+        (x0, y0 + 2000), (x0, y0)]]}
+    m = c.polygon_mask(clc, square, crs=c.CORINE_CRS)
+    assert m.dtype == bool and m.values.sum() == 400
+    assert m.values[10:30, 10:30].all()
+
+
+def test_urban_core_keeps_city_drops_village_and_speck(clc_settl):
+    core = c.urban_core_mask(clc_settl).values
+    urban_all = c.class_mask(clc_settl, c.URBAN_CODES).values
+    city = urban_all & (dist_from_centre(clc_settl) < 6_100)
+    np.testing.assert_array_equal(core, city)
+    assert not core[VILLAGE].any() and not core[SPECK].any()
+
+
+def test_urban_core_min_cluster_and_radius(clc_settl):
+    core = c.urban_core_mask(clc_settl, radius_m=16_000, min_cluster_px=1)
+    assert core.values[VILLAGE].all() and core.values[SPECK].all()
+
+
+def test_urban_core_clipped_to_boundary(clc):
+    west_half = {"type": "Polygon", "coordinates": [[
+        (19.0, 49.0), (c.KRAKOW_CENTRE[0], 49.0),
+        (c.KRAKOW_CENTRE[0], 51.0), (19.0, 51.0), (19.0, 49.0)]]}
+    core = c.urban_core_mask(clc, boundary=west_half).values
+    full = c.urban_core_mask(clc).values
+    assert 0 < core.sum() < full.sum()
+    assert pixel_lon(clc)[core].max() <= c.KRAKOW_CENTRE[0]
+    np.testing.assert_array_equal(core, full & (pixel_lon(clc) <= c.KRAKOW_CENTRE[0]))
+
+
+def test_rural_reference_default_criteria(clc_settl):
+    urban = c.urban_core_mask(clc_settl)
+    rural = c.rural_reference_mask(clc_settl, urban=urban)
+    r = rural.values
+    assert r.any()
+    assert set(np.unique(clc_settl.values[r])) == {211, 311}
+    d_core = c.distance_to(urban).values[r]
+    assert d_core.min() >= 5_000 and d_core.max() <= 20_000
+    # villages are buffered out, the city never overlaps
+    d_any = c.distance_to(c.class_mask(clc_settl, c.URBAN_CODES)).values[r]
+    assert d_any.min() >= 500
+    assert not (r & urban.values).any()
+    assert rural.attrs["min_distance_m"] == 5_000
+
+
+def test_rural_reference_settlement_buffer_disabled(clc_settl):
+    with_buf = c.rural_reference_mask(clc_settl).values
+    no_buf = c.rural_reference_mask(clc_settl, settlement_buffer_m=0).values
+    assert no_buf.sum() > with_buf.sum()
+    assert not no_buf[VILLAGE].any()  # built-up pixels are never rural
+
+
+def test_rural_reference_class_selection(clc_settl):
+    forest = c.rural_reference_mask(clc_settl, classes=c.FOREST_CODES).values
+    assert forest.any()
+    assert np.all(clc_settl.values[forest] == 311)
+
+
+def test_rural_reference_invalid_ring(clc):
+    with pytest.raises(ValueError):
+        c.rural_reference_mask(clc, min_distance_m=10_000, max_distance_m=5_000)
+
+
+def make_dem(clc, step=1):
+    """Plane rising eastwards by 10 m/km, 200 m at the city centre."""
+    x = clc.x.values[::step]
+    y = clc.y.values[::step]
+    z = 200 + 0.01 * (np.tile(x, (len(y), 1)) - CX)
+    return xr.DataArray(z, dims=("y", "x"), coords={"x": x, "y": y})
+
+
+@pytest.mark.parametrize("step", [1, 2])
+def test_rural_reference_elevation_filter(clc, step):
+    dem = make_dem(clc, step)
+    rural = c.rural_reference_mask(clc, dem=dem, max_elev_diff_m=50)
+    r = rural.values
+    assert r.any()
+    assert rural.attrs["reference_elevation_m"] == pytest.approx(200, abs=10)
+    xx = np.tile(clc.x.values, (clc.shape[0], 1))
+    # only pixels within ~5 km east/west of the centre survive
+    assert np.abs(xx[r] - CX).max() <= 5_000 + 10 * RES
+    assert r.sum() < c.rural_reference_mask(clc).values.sum()
+
+
+def test_rural_reference_manual_region(clc):
+    west = {"type": "Polygon", "coordinates": [[
+        (19.0, 49.0), (19.85, 49.0), (19.85, 51.0), (19.0, 51.0), (19.0, 49.0)]]}
+    r = c.rural_reference_mask(clc, region=west).values
+    assert r.any()
+    assert pixel_lon(clc)[r].max() <= 19.85
+    full = c.rural_reference_mask(clc).values
+    assert full[pixel_lon(clc) > 19.85].any()  # the region really restricts
+
+
+def test_urban_rural_masks_dataset(clc_settl):
+    ds = c.urban_rural_masks(clc_settl, rural_kwargs={"max_distance_m": 15_000})
+    assert set(ds.data_vars) == {"urban", "rural", "distance_to_urban"}
+    assert ds["urban"].dtype == bool and ds["rural"].dtype == bool
+    assert not (ds["urban"] & ds["rural"]).any()
+    assert ds["urban"].values[N // 2, N // 2]
+    assert float(ds["distance_to_urban"].where(ds["rural"]).max()) <= 15_000
+    assert ds.attrs["crs"] == c.CORINE_CRS

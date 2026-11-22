@@ -4,4 +4,7 @@ rioxarray
 netCDF4
 pyhdf
 earthaccess
+rasterio
+pyproj
+scipy
 pytest
