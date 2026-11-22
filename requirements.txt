@@ -1,0 +1,5 @@
+numpy
+xarray
+rioxarray
+netCDF4
+earthaccess
