@@ -11,7 +11,8 @@ For every observation date the module computes
 * the mean surface temperature of the urban (``T_u``) and rural reference
   (``T_r``) pixels, separately for day and night,
 * the SUHI intensity ``dT_SUHI = T_u - T_r`` for day and night,
-* the day-night difference of the SUHI ``D_SUHI = dT_SUHI^day - dT_SUHI^night``.
+* the day-night difference of the SUHI ``D_SUHI = dT_SUHI^day - dT_SUHI^night``,
+* day-night LST differences of CORINE classes ``D_c = T_c^day - T_c^night``.
 """
 
 from __future__ import annotations
@@ -23,6 +24,8 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from corine_utils import DEFAULT_MIN_COVERAGE, clc_name
+
 logger = logging.getLogger(__name__)
 
 PERIODS = ("day", "night")
@@ -31,6 +34,10 @@ PERIODS = ("day", "night")
 # has a valid (cloud-free, QC-passed) LST value on that date; partially
 # clouded zones would otherwise give means of an unrepresentative subset.
 DEFAULT_MIN_VALID_FRACTION = 0.5
+
+# A MODIS pixel represents a CLC class if the class covers at least this
+# share of it ("pure" pixels; same threshold as the rural reference).
+DEFAULT_CLASS_FRACTION = 0.75
 
 Zones = Mapping[object, xr.DataArray] | xr.Dataset
 
@@ -228,3 +235,92 @@ def diurnal_suhi_difference(suhi: xr.DataArray) -> xr.DataArray:
     d.attrs = {"units": "degC",
                "long_name": "day-night difference of SUHI intensity"}
     return d
+
+
+# ---------------------------------------------------------------------------
+# Day-night differences of land-cover classes
+# ---------------------------------------------------------------------------
+
+
+def class_masks(
+    fractions: xr.Dataset,
+    classes: tuple[int, ...] | None = None,
+    min_fraction: float = DEFAULT_CLASS_FRACTION,
+    min_coverage: float = DEFAULT_MIN_COVERAGE,
+) -> dict[int, xr.DataArray]:
+    """Boolean ``(y, x)`` masks of MODIS pixels dominated by single CLC classes.
+
+    ``fractions`` is the output of :func:`corine_utils.class_fractions`. A
+    pixel belongs to class ``c`` if ``c`` covers at least ``min_fraction``
+    of its valid CLC area and at least ``min_coverage`` of the pixel has
+    CLC data. ``classes`` defaults to all classes in ``fractions``.
+    """
+    if not 0.5 < min_fraction <= 1.0:
+        # above 0.5 a pixel can belong to at most one class
+        raise ValueError("min_fraction must be within (0.5, 1]")
+    frac = fractions["fraction"]
+    available = [int(k) for k in frac["clc_class"].values]
+    classes = available if classes is None else [int(k) for k in classes]
+    missing = [k for k in classes if k not in available]
+    if missing:
+        raise ValueError(f"Classes not in fractions: {missing}")
+
+    ok = fractions["coverage"] >= min_coverage if "coverage" in fractions else True
+    out = {}
+    for code in classes:
+        mask = (frac.sel(clc_class=code, drop=True) >= min_fraction) & ok
+        out[code] = mask.drop_vars("clc_name", errors="ignore").rename(f"clc_{code}")
+    return out
+
+
+def class_diurnal_difference(
+    lst: xr.Dataset,
+    fractions: xr.Dataset,
+    classes: tuple[int, ...] | None = None,
+    min_fraction: float = DEFAULT_CLASS_FRACTION,
+    min_coverage: float = DEFAULT_MIN_COVERAGE,
+    min_valid_fraction: float = DEFAULT_MIN_VALID_FRACTION,
+    paired: bool = True,
+) -> xr.Dataset:
+    """Day-night LST difference ``D_c = T_c^day - T_c^night`` per CLC class.
+
+    Class pixels are selected with :func:`class_masks`. By default
+    (``paired=True``) day and night means use the same pixels on each date,
+    so differing cloud masks do not bias ``D_c``.
+
+    Returns
+    -------
+    Dataset on ``(time, clc_class)`` with ``t_day``, ``t_night`` and
+    ``d`` [degC], ``n_valid_day`` / ``n_valid_night`` and the class size
+    ``n_pixels``; ``clc_name`` is attached as a coordinate. Classes
+    without any pure pixel are kept with NaN values.
+    """
+    masks = class_masks(fractions, classes, min_fraction, min_coverage)
+    stats = zone_statistics(lst, masks, min_valid_fraction=min_valid_fraction,
+                            paired=paired).rename(zone="clc_class")
+    mean, n_valid = stats["mean"], stats["n_valid"]
+    codes = [int(k) for k in stats["clc_class"].values]
+
+    ds = xr.Dataset(
+        {
+            "t_day": mean.sel(period="day", drop=True),
+            "t_night": mean.sel(period="night", drop=True),
+            "d": day_minus_night(mean),
+            "n_valid_day": n_valid.sel(period="day", drop=True),
+            "n_valid_night": n_valid.sel(period="night", drop=True),
+            "n_pixels": stats["n_pixels"],
+        },
+        attrs={**stats.attrs, "min_fraction": min_fraction,
+               "min_coverage": min_coverage},
+    )
+    ds = ds.assign_coords(clc_class=codes,
+                          clc_name=("clc_class", [clc_name(k) for k in codes]))
+    ds["t_day"].attrs = {"units": "degC", "long_name": "mean daytime LST of class"}
+    ds["t_night"].attrs = {"units": "degC", "long_name": "mean nighttime LST of class"}
+    ds["d"].attrs = {"units": "degC",
+                     "long_name": "day-night LST difference of class (T_day - T_night)"}
+    empty = [k for k in codes if int(ds["n_pixels"].sel(clc_class=k)) == 0]
+    if empty:
+        logger.warning("No MODIS pixel with >= %.0f %% of class(es) %s",
+                       100 * min_fraction, empty)
+    return ds

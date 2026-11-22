@@ -54,6 +54,30 @@ def zone_field(period, pad=0):
     return field
 
 
+def make_fractions():
+    """class_fractions-like output: 111 west, 211 east, mixed pixels between.
+
+    Column 3 is a 60/40 mix of 112/211 (not pure), column 4 is 311 but
+    with too little CLC coverage, one 211 pixel is only 80 % covered.
+    """
+    codes = [111, 112, 211, 311]
+    frac = np.zeros((len(codes), NY, NX))
+    frac[0, :, :3] = 1.0
+    frac[1, :, 3], frac[2, :, 3] = 0.6, 0.4
+    frac[3, :, 4] = 1.0
+    frac[2, :, 5:] = 1.0
+    coverage = np.ones((NY, NX))
+    coverage[:, 4] = 0.5
+    coverage[0, 7] = 0.8
+    x, y = coords()
+    return xr.Dataset(
+        {"fraction": (("clc_class", "y", "x"), frac),
+         "coverage": (("y", "x"), coverage)},
+        coords={"clc_class": codes, "x": x, "y": y,
+                "clc_name": ("clc_class", [f"class {k}" for k in codes])},
+    )
+
+
 def make_lst(pad=2, n_days=3):
     """Processed-LST-like dataset on a grid larger than the masks."""
     x, y = coords(pad)
@@ -208,3 +232,54 @@ def test_diurnal_suhi_difference_nan_without_night():
 def test_day_minus_night_requires_period():
     with pytest.raises(ValueError):
         s.day_minus_night(xr.DataArray([1.0], dims="time"))
+
+
+# ---------------------------------------------------------------------------
+# Day-night differences of land-cover classes
+# ---------------------------------------------------------------------------
+
+
+def test_class_masks_pure_pixels_and_coverage():
+    masks = s.class_masks(make_fractions())
+    assert list(masks) == [111, 112, 211, 311]
+    assert int(masks[111].sum()) == 3 * NY
+    assert not masks[112].any()                      # 60 % mix is not pure
+    assert not masks[311].any()                      # coverage below 0.9
+    assert int(masks[211].sum()) == 3 * NY - 1       # one pixel 80 % covered
+    loose = s.class_masks(make_fractions(), classes=(211,), min_coverage=0.5)
+    assert list(loose) == [211] and int(loose[211].sum()) == 3 * NY
+
+
+def test_class_masks_input_validation():
+    with pytest.raises(ValueError):
+        s.class_masks(make_fractions(), classes=(999,))
+    with pytest.raises(ValueError):
+        s.class_masks(make_fractions(), min_fraction=0.4)
+
+
+def test_class_diurnal_difference():
+    ds = s.class_diurnal_difference(make_lst(), make_fractions())
+    assert ds["d"].dims == ("time", "clc_class")
+    assert list(ds.clc_class.values) == [111, 112, 211, 311]
+    assert ds.clc_name.sel(clc_class=111) == "Continuous urban fabric"
+    np.testing.assert_allclose(ds["t_day"].sel(clc_class=111), T["urban"]["day"])
+    np.testing.assert_allclose(ds["d"].sel(clc_class=111),
+                               T["urban"]["day"] - T["urban"]["night"])
+    np.testing.assert_allclose(ds["d"].sel(clc_class=211),
+                               T["rural"]["day"] - T["rural"]["night"])
+    # classes without pure pixels are kept as NaN
+    assert ds["d"].sel(clc_class=112).isnull().all()
+    assert int(ds["n_pixels"].sel(clc_class=112)) == 0
+
+
+def test_class_diurnal_difference_is_paired_by_default():
+    lst = make_lst(pad=0)
+    lst["lst_night"][0, :, 0] = np.nan     # night clouds over one 111 column
+    lst["lst_day"][0, :, 0] = 60.0         # that column is hot by day
+    paired = s.class_diurnal_difference(lst, make_fractions(), classes=(111,))
+    unpaired = s.class_diurnal_difference(lst, make_fractions(), classes=(111,),
+                                          paired=False)
+    expected = T["urban"]["day"] - T["urban"]["night"]
+    assert float(paired["d"].isel(time=0, clc_class=0)) == pytest.approx(expected)
+    assert float(unpaired["d"].isel(time=0, clc_class=0)) > expected
+    assert int(paired["n_valid_day"].isel(time=0, clc_class=0)) == 2 * NY
