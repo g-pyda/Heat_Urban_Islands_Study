@@ -327,3 +327,127 @@ def load_lst_layers(path: Path | str, product: ModisProduct) -> xr.Dataset:
         night_overpass_lst=product.night_overpass_lst,
     )
     return ds
+
+
+# ---------------------------------------------------------------------------
+# Quality control
+# ---------------------------------------------------------------------------
+# QC_Day / QC_Night bit layout (MOD11 C6.1 user guide, Table 13):
+#
+#   bits 1-0  Mandatory QA   00 LST produced, good quality
+#                            01 LST produced, other quality (check other bits)
+#                            10 LST not produced due to cloud effects
+#                            11 LST not produced, other reasons
+#   bits 3-2  Data quality   00 good, 01 other quality, 1x TBD
+#   bits 5-4  Emissivity err 00 <=0.01, 01 <=0.02, 10 <=0.04, 11 >0.04
+#   bits 7-6  LST error      00 <=1 K,  01 <=2 K,  10 <=3 K,  11 >3 K
+
+QC_GOOD = 0b00
+QC_OTHER_QUALITY = 0b01
+QC_CLOUD = 0b10
+QC_NOT_PRODUCED = 0b11
+
+# Upper bound [K] of each LST error class (bits 7-6)
+_LST_ERROR_CLASS_MAX_K = (1.0, 2.0, 3.0, np.inf)
+
+LST_QC_PAIRS = {LST_DAY: QC_DAY, LST_NIGHT: QC_NIGHT}
+VIEW_TIME_OF = {LST_DAY: VIEW_TIME_DAY, LST_NIGHT: VIEW_TIME_NIGHT}
+
+
+def decode_qc(qc: xr.DataArray) -> xr.Dataset:
+    """Split a QC_Day/QC_Night byte into its four 2-bit fields."""
+    qc = qc.astype(np.uint8)
+    return xr.Dataset({
+        "mandatory_qa": qc & 0b11,
+        "data_quality": (qc >> 2) & 0b11,
+        "emissivity_error": (qc >> 4) & 0b11,
+        "lst_error": (qc >> 6) & 0b11,
+    })
+
+
+def quality_mask(
+    qc: xr.DataArray,
+    max_lst_error: float | None = 2.0,
+    allow_other_quality: bool = True,
+) -> xr.DataArray:
+    """Boolean mask of pixels to keep (``True`` = usable retrieval).
+
+    Parameters
+    ----------
+    qc:
+        Raw ``QC_Day`` or ``QC_Night`` layer.
+    max_lst_error:
+        Largest accepted LST error class in kelvin (1, 2 or 3);
+        ``None`` disables the check.
+    allow_other_quality:
+        If ``False`` only "good quality" (mandatory QA = 00) pixels are kept
+        (strict mode). If ``True`` "other quality" (01) pixels are also kept,
+        provided they pass the LST error threshold.
+
+    Cloud-affected (10) and not-produced (11) pixels are always rejected.
+    """
+    fields = decode_qc(qc)
+    accepted = [QC_GOOD, QC_OTHER_QUALITY] if allow_other_quality else [QC_GOOD]
+    keep = fields["mandatory_qa"].isin(accepted)
+
+    if max_lst_error is not None:
+        if max_lst_error not in _LST_ERROR_CLASS_MAX_K[:3]:
+            raise ValueError("max_lst_error must be 1, 2, 3 or None")
+        max_class = _LST_ERROR_CLASS_MAX_K.index(max_lst_error)
+        keep &= fields["lst_error"] <= max_class
+
+    return keep.rename("quality_mask")
+
+
+def apply_qc(
+    lst: xr.DataArray,
+    qc: xr.DataArray,
+    max_lst_error: float | None = 2.0,
+    allow_other_quality: bool = True,
+) -> xr.DataArray:
+    """Set rejected, fill-valued and out-of-range LST pixels to NaN.
+
+    Values stay as digital numbers (float32); conversion to Celsius is done
+    separately.
+    """
+    lo, hi = LST_VALID_RANGE
+    valid = (lst != LST_FILL) & (lst >= lo) & (lst <= hi)
+    keep = valid & quality_mask(qc, max_lst_error, allow_other_quality)
+
+    attrs = {k: v for k, v in lst.attrs.items() if k != "_FillValue"}
+    out = lst.astype(np.float32).where(keep)
+    out.attrs = attrs
+    return out
+
+
+def mask_granule(
+    ds: xr.Dataset,
+    max_lst_error: float | None = 2.0,
+    allow_other_quality: bool = True,
+) -> xr.Dataset:
+    """Apply QC masking to the day and night layers of a loaded granule.
+
+    LST pixels failing QC become NaN, and the matching view-time pixels are
+    masked as well so that each valid temperature has a valid timestamp.
+    Masking statistics are stored as ``valid_fraction_*`` attributes.
+    """
+    out = ds.copy()
+    for lst_name, qc_name in LST_QC_PAIRS.items():
+        if lst_name not in ds or qc_name not in ds:
+            continue
+        masked = apply_qc(ds[lst_name], ds[qc_name], max_lst_error, allow_other_quality)
+        out[lst_name] = masked
+
+        vt_name = VIEW_TIME_OF[lst_name]
+        if vt_name in ds:
+            vt_attrs = {k: v for k, v in ds[vt_name].attrs.items() if k != "_FillValue"}
+            out[vt_name] = ds[vt_name].astype(np.float32).where(masked.notnull())
+            out[vt_name].attrs = vt_attrs
+
+        out.attrs[f"valid_fraction_{lst_name}"] = float(masked.notnull().mean())
+
+    out.attrs.update(
+        qc_max_lst_error=str(max_lst_error),
+        qc_allow_other_quality=int(allow_other_quality),
+    )
+    return out
