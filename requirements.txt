@@ -1,5 +1,6 @@
 numpy
 xarray
+pandas
 rioxarray
 netCDF4
 pyhdf
