@@ -151,3 +151,34 @@ def test_zone_statistics_input_validation():
         s.zone_statistics(make_lst().drop_vars("lst_night"), masks)
     with pytest.raises(ValueError):
         s.zone_statistics(make_lst(), masks, min_valid_fraction=1.5)
+
+
+# ---------------------------------------------------------------------------
+# SUHI intensity
+# ---------------------------------------------------------------------------
+
+
+def test_suhi_intensity_day_and_night():
+    suhi = s.suhi_intensity(s.urban_rural_lst(make_lst(), make_masks()))
+    assert suhi.name == "suhi" and suhi.dims == ("time", "period")
+    assert "zone" not in suhi.coords
+    for period in s.PERIODS:
+        np.testing.assert_allclose(suhi.sel(period=period),
+                                   T["urban"][period] - T["rural"][period])
+
+
+def test_suhi_intensity_nan_when_zone_mean_missing():
+    lst = make_lst(pad=0)
+    lst["lst_night"][1, :, 5:] = np.nan  # rural zone clouded on night 2
+    suhi = s.suhi_intensity(s.urban_rural_lst(lst, make_masks()))
+    assert np.isnan(suhi.sel(period="night").isel(time=1))
+    assert np.isfinite(suhi.sel(period="day").isel(time=1))
+
+
+def test_suhi_intensity_custom_zone_names():
+    masks = make_masks()
+    stats = s.zone_statistics(make_lst(), {"city": masks.urban, "fields": masks.rural})
+    suhi = s.suhi_intensity(stats, urban="city", rural="fields")
+    np.testing.assert_allclose(suhi.sel(period="day"), 4.0)
+    with pytest.raises(ValueError):
+        s.suhi_intensity(stats)

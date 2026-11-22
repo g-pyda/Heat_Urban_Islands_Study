@@ -9,7 +9,8 @@ land-cover masks aggregated to the same 1 km grid in :mod:`corine_utils`
 For every observation date the module computes
 
 * the mean surface temperature of the urban (``T_u``) and rural reference
-  (``T_r``) pixels, separately for day and night.
+  (``T_r``) pixels, separately for day and night,
+* the SUHI intensity ``dT_SUHI = T_u - T_r`` for day and night.
 """
 
 from __future__ import annotations
@@ -174,3 +175,31 @@ def urban_rural_lst(
     """
     return zone_statistics(lst, {"urban": masks["urban"], "rural": masks["rural"]},
                            min_valid_fraction=min_valid_fraction, paired=paired)
+
+
+# ---------------------------------------------------------------------------
+# SUHI intensity
+# ---------------------------------------------------------------------------
+
+
+def suhi_intensity(
+    stats: xr.Dataset,
+    urban: object = "urban",
+    rural: object = "rural",
+) -> xr.DataArray:
+    """SUHI intensity ``dT_SUHI = T_u - T_r`` [degC] on ``(time, period)``.
+
+    ``stats`` is the output of :func:`urban_rural_lst` (or
+    :func:`zone_statistics` with the zones named ``urban`` / ``rural``).
+    The intensity is NaN on dates where either zone mean is missing.
+    """
+    zones = list(stats["zone"].values)
+    for name in (urban, rural):
+        if name not in zones:
+            raise ValueError(f"Zone {name!r} not in statistics (have {zones})")
+    mean = stats["mean"]
+    suhi = mean.sel(zone=urban, drop=True) - mean.sel(zone=rural, drop=True)
+    suhi.name = "suhi"
+    suhi.attrs = {"units": "degC",
+                  "long_name": "surface urban heat island intensity (T_u - T_r)"}
+    return suhi
