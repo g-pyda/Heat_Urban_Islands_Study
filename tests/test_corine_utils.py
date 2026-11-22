@@ -147,3 +147,65 @@ def test_clc_at_projected_coordinates(clc):
 def test_clc_name():
     assert c.clc_name(311) == "Broad-leaved forest"
     assert c.clc_name(0) == "No data"
+
+
+# ---------------------------------------------------------------------------
+# Land-cover class masks
+# ---------------------------------------------------------------------------
+
+
+def test_class_mask_single_and_multiple_codes(clc):
+    forest = c.class_mask(clc, 311)
+    urban = c.class_mask(clc, c.URBAN_CODES)
+    assert forest.dtype == bool and forest.shape == clc.shape
+    np.testing.assert_array_equal(forest.values, clc.values == 311)
+    np.testing.assert_array_equal(
+        urban.values, np.isin(clc.values, [111, 112, 121])
+    )
+    assert urban.attrs["clc_codes"] == [111, 112, 121]
+    assert "nodata" not in urban.attrs
+
+
+def test_class_mask_excludes_nodata(clc):
+    assert not c.class_mask(clc, c.CLC_CODES).values[0].any()
+
+
+def test_class_mask_rejects_unknown_codes(clc):
+    with pytest.raises(ValueError, match="999"):
+        c.class_mask(clc, [111, 999])
+
+
+def test_land_cover_masks_default_groups(clc):
+    ds = c.land_cover_masks(clc)
+    assert set(ds.data_vars) == {"urban", "forest", "arable", "valid"}
+    assert ds.attrs["crs"] == c.CORINE_CRS
+    # groups are mutually exclusive and all lie within valid pixels
+    stacked = np.stack([ds[k].values for k in ("urban", "forest", "arable")])
+    assert stacked.sum(axis=0).max() == 1
+    assert not (stacked.any(axis=0) & ~ds["valid"].values).any()
+    # the synthetic raster contains only these classes besides no-data
+    np.testing.assert_array_equal(stacked.any(axis=0), ds["valid"].values)
+    assert ds["forest"].attrs["clc_names"] == ["Broad-leaved forest"]
+
+
+def test_land_cover_masks_custom_groups(clc):
+    ds = c.land_cover_masks(clc, {"fabric": (111, 112)})
+    assert set(ds.data_vars) == {"fabric", "valid"}
+    np.testing.assert_array_equal(
+        ds["fabric"].values, np.isin(clc.values, [111, 112])
+    )
+
+
+def test_masks_agree_with_point_lookup(clc):
+    ds = c.land_cover_masks(clc)
+    x, y = ds.x.values[[200, 395, 10]], ds.y.values[[200, 200, 200]]
+    codes = c.clc_at(clc, x, y, crs=c.CORINE_CRS)
+    np.testing.assert_array_equal(codes, [111, 311, 211])
+    assert ds["urban"].values[200, 200] and ds["forest"].values[200, 395]
+
+
+def test_class_shares(clc):
+    shares = c.class_shares(clc)
+    assert sum(shares.values()) == pytest.approx(1.0)
+    assert set(shares) == {111, 112, 121, 211, 311}
+    assert shares[211] > shares[311] > 0

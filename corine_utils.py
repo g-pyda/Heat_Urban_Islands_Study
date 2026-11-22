@@ -250,3 +250,80 @@ def clc_at(
 def clc_name(code: int) -> str:
     """Human-readable name of a CLC class code."""
     return CLC_CLASSES.get(int(code), "No data")
+
+
+# ---------------------------------------------------------------------------
+# Land-cover class masks
+# ---------------------------------------------------------------------------
+# Classes relevant for the urban heat island analysis:
+# built-up surfaces (urban fabric + industrial) versus the two dominant
+# rural surface types around Krakow (arable land and broad-leaved forest).
+
+URBAN_CODES = (111, 112, 121)   # continuous/discontinuous fabric, industrial
+FOREST_CODES = (311,)           # broad-leaved forest
+ARABLE_CODES = (211,)           # non-irrigated arable land
+
+CLASS_GROUPS: dict[str, tuple[int, ...]] = {
+    "urban": URBAN_CODES,
+    "forest": FOREST_CODES,
+    "arable": ARABLE_CODES,
+}
+
+
+def class_mask(clc: xr.DataArray, codes) -> xr.DataArray:
+    """Boolean mask of pixels whose CLC code is in ``codes``.
+
+    ``codes`` is a single code or an iterable of codes; unknown codes raise
+    ``ValueError``. No-data pixels are always ``False``.
+    """
+    codes = tuple(np.atleast_1d(codes).astype(int).tolist())
+    unknown = [code for code in codes if code not in CLC_CLASSES]
+    if unknown:
+        raise ValueError(f"Unknown CLC codes: {unknown}")
+
+    mask = xr.DataArray(
+        np.isin(clc.values, codes),
+        dims=clc.dims,
+        coords=clc.coords,
+        attrs={**clc.attrs, "clc_codes": list(codes)},
+    )
+    mask.attrs.pop("nodata", None)
+    return mask
+
+
+def valid_mask(clc: xr.DataArray) -> xr.DataArray:
+    """Boolean mask of pixels holding a valid CLC class (not no-data)."""
+    return class_mask(clc, CLC_CODES).rename("valid")
+
+
+def land_cover_masks(
+    clc: xr.DataArray,
+    groups: dict[str, tuple[int, ...]] | None = None,
+) -> xr.Dataset:
+    """Boolean masks for each land-cover group plus the ``valid`` mask.
+
+    Parameters
+    ----------
+    clc:
+        CLC code raster from :func:`load_corine`.
+    groups:
+        Mapping ``name -> CLC codes``; defaults to :data:`CLASS_GROUPS`
+        (``urban``, ``forest``, ``arable``).
+    """
+    groups = CLASS_GROUPS if groups is None else groups
+    masks = {name: class_mask(clc, codes) for name, codes in groups.items()}
+    masks["valid"] = valid_mask(clc)
+    ds = xr.Dataset(masks)
+    ds.attrs = {k: v for k, v in clc.attrs.items() if k != "nodata"}
+    for name, codes in groups.items():
+        ds[name].attrs["clc_names"] = [clc_name(code) for code in codes]
+    return ds
+
+
+def class_shares(clc: xr.DataArray) -> dict[int, float]:
+    """Share of each CLC class among the valid pixels of the raster."""
+    values = clc.values[clc.values != CLC_NODATA]
+    if values.size == 0:
+        return {}
+    codes, counts = np.unique(values, return_counts=True)
+    return {int(k): n / values.size for k, n in zip(codes, counts)}
