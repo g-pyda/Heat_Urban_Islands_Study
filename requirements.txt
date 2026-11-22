@@ -2,4 +2,5 @@ numpy
 xarray
 rioxarray
 netCDF4
+pyhdf
 earthaccess

@@ -12,8 +12,9 @@ The goal is cleaned day and night LST maps in degrees Celsius, exported as
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
@@ -188,3 +189,141 @@ def download_granules(
 
     files = earthaccess.download(results, local_path=str(out_dir))
     return sorted(Path(f) for f in files)
+
+
+# ---------------------------------------------------------------------------
+# Loading raw layers
+# ---------------------------------------------------------------------------
+# MOD11A1/MYD11A1 granules are HDF4-EOS files. GDAL builds shipped with pip
+# wheels usually lack the HDF4 driver, so the files are read with ``pyhdf``
+# and the sinusoidal grid coordinates are rebuilt from the EOS metadata.
+
+# MODIS sinusoidal projection (sphere of radius 6371007.181 m)
+MODIS_SINUSOIDAL_PROJ4 = (
+    "+proj=sinu +lon_0=0 +x_0=0 +y_0=0 +R=6371007.181 +units=m +no_defs"
+)
+
+# SDS attributes worth keeping on the raw arrays
+_KEPT_SDS_ATTRS = (
+    "long_name", "units", "valid_range", "_FillValue", "scale_factor", "add_offset",
+)
+
+_GRANULE_RE = re.compile(
+    r"^(?P<product>M[OY]D11A1)\.A(?P<year>\d{4})(?P<doy>\d{3})"
+    r"\.(?P<tile>h\d{2}v\d{2})\.(?P<version>\d{3})"
+)
+
+
+def parse_granule_name(path: Path | str) -> dict:
+    """Parse product, acquisition date, tile and version from a file name.
+
+    Example: ``MOD11A1.A2025182.h19v03.061.2025184093512.hdf``.
+    """
+    name = Path(path).name
+    match = _GRANULE_RE.match(name)
+    if match is None:
+        raise ValueError(f"Not a MOD11A1/MYD11A1 granule name: {name}")
+    acq = datetime.strptime(match["year"] + match["doy"], "%Y%j")
+    return {
+        "product": match["product"],
+        "date": acq,
+        "tile": match["tile"],
+        "version": match["version"],
+    }
+
+
+def _parse_grid_metadata(struct_metadata: str) -> dict:
+    """Extract grid size and corner coordinates from ``StructMetadata.0``."""
+
+    def _find(pattern: str) -> str:
+        match = re.search(pattern, struct_metadata)
+        if match is None:
+            raise ValueError(f"StructMetadata entry not found: {pattern}")
+        return match.group(1)
+
+    ul = _find(r"UpperLeftPointMtrs=\(([^)]*)\)").split(",")
+    lr = _find(r"LowerRightMtrs=\(([^)]*)\)").split(",")
+    return {
+        "nx": int(_find(r"XDim=(\d+)")),
+        "ny": int(_find(r"YDim=(\d+)")),
+        "ulx": float(ul[0]), "uly": float(ul[1]),
+        "lrx": float(lr[0]), "lry": float(lr[1]),
+    }
+
+
+def _sinusoidal_coords(grid: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Pixel-centre x/y coordinates (metres) of the sinusoidal grid."""
+    dx = (grid["lrx"] - grid["ulx"]) / grid["nx"]
+    dy = (grid["lry"] - grid["uly"]) / grid["ny"]  # negative (north-up)
+    x = grid["ulx"] + dx * (np.arange(grid["nx"]) + 0.5)
+    y = grid["uly"] + dy * (np.arange(grid["ny"]) + 0.5)
+    return x, y
+
+
+def open_granule(
+    path: Path | str,
+    layers: tuple[str, ...] = REQUIRED_LAYERS,
+) -> xr.Dataset:
+    """Read raw (unscaled) layers of one MOD11A1/MYD11A1 granule.
+
+    Returns a Dataset with dims ``(y, x)`` in MODIS sinusoidal metres, a
+    scalar ``time`` coordinate (acquisition day) and the original digital
+    numbers; scaling and masking happen in later steps.
+    """
+    from pyhdf.SD import SD, SDC  # HDF4 reader
+
+    path = Path(path)
+    info = parse_granule_name(path)
+
+    hdf = SD(str(path), SDC.READ)
+    try:
+        grid = _parse_grid_metadata(hdf.attributes()["StructMetadata.0"])
+        available = hdf.datasets()
+        data_vars = {}
+        for name in layers:
+            if name not in available:
+                raise KeyError(f"Layer {name!r} missing in {path.name}")
+            sds = hdf.select(name)
+            try:
+                values = sds.get()
+                attrs = {k: v for k, v in sds.attributes().items()
+                         if k in _KEPT_SDS_ATTRS}
+            finally:
+                sds.endaccess()
+            data_vars[name] = (("y", "x"), values, attrs)
+    finally:
+        hdf.end()
+
+    x, y = _sinusoidal_coords(grid)
+    return xr.Dataset(
+        data_vars,
+        coords={"x": x, "y": y, "time": np.datetime64(info["date"], "ns")},
+        attrs={
+            "product": info["product"],
+            "tile": info["tile"],
+            "collection": info["version"],
+            "source_file": path.name,
+            "crs": MODIS_SINUSOIDAL_PROJ4,
+        },
+    )
+
+
+def load_lst_layers(path: Path | str, product: ModisProduct) -> xr.Dataset:
+    """Load LST, QC and view-time layers (day and night) for one granule.
+
+    Checks that the file belongs to ``product`` so Terra and Aqua granules
+    cannot be mixed up, and tags the result with the platform and its
+    nominal overpass times.
+    """
+    info = parse_granule_name(path)
+    if info["product"] != product.short_name:
+        raise ValueError(
+            f"{Path(path).name} is {info['product']}, expected {product.short_name}"
+        )
+    ds = open_granule(path, REQUIRED_LAYERS)
+    ds.attrs.update(
+        platform=product.platform,
+        day_overpass_lst=product.day_overpass_lst,
+        night_overpass_lst=product.night_overpass_lst,
+    )
+    return ds
