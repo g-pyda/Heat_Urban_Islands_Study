@@ -368,3 +368,172 @@ def test_urban_rural_masks_dataset(clc_settl):
     assert ds["urban"].values[N // 2, N // 2]
     assert float(ds["distance_to_urban"].where(ds["rural"]).max()) <= 15_000
     assert ds.attrs["crs"] == c.CORINE_CRS
+
+
+# ---------------------------------------------------------------------------
+# Aggregation to the 1 km MODIS grid
+# ---------------------------------------------------------------------------
+
+B = 10  # CLC pixels per 1 km block in the aligned LAEA test grid
+MODIS_PX = 1111950.519667 / 1200  # MODIS 1 km pixel size [m]
+
+
+def laea_km_grid():
+    """1 km grid in EPSG:3035 exactly aligned with the CLC raster."""
+    n = N // B
+    x = ORIGIN_X + B * RES * (np.arange(n) + 0.5)
+    y = ORIGIN_Y - B * RES * (np.arange(n) + 0.5)
+    return xr.Dataset(coords={"x": x, "y": y}, attrs={"crs": c.CORINE_CRS})
+
+
+def modis_grid(half_size_px=40):
+    """MODIS-like sinusoidal grid around Krakow (no CRS attribute)."""
+    from modis_processing import MODIS_SINUSOIDAL_PROJ4
+
+    sx, sy = Transformer.from_crs("EPSG:4326", MODIS_SINUSOIDAL_PROJ4,
+                                  always_xy=True).transform(*c.KRAKOW_CENTRE)
+    i0, j0 = np.floor(sx / MODIS_PX), np.floor(sy / MODIS_PX)
+    k = np.arange(-half_size_px, half_size_px)
+    x = (i0 + k + 0.5) * MODIS_PX
+    y = (j0 - k + 0.5) * MODIS_PX  # north-up
+    return xr.Dataset(coords={"x": x, "y": y})
+
+
+def block_mean(a):
+    a = np.asarray(a, float)
+    return a.reshape(N // B, B, N // B, B).mean(axis=(1, 3))
+
+
+def test_class_fractions_aligned_grid_matches_block_counts(clc):
+    fr = c.class_fractions(clc, laea_km_grid())
+    assert fr["fraction"].dims == ("clc_class", "y", "x")
+    assert fr["fraction"].shape == (5, N // B, N // B)
+    assert list(fr["clc_class"].values) == [111, 112, 121, 211, 311]
+    valid = clc.values != c.CLC_NODATA
+    for code in fr["clc_class"].values:
+        expected = block_mean(clc.values == code) / block_mean(valid)
+        np.testing.assert_allclose(fr["fraction"].sel(clc_class=code), expected,
+                                   atol=1e-6)
+
+
+def test_class_fractions_sum_to_one_and_coverage(clc):
+    fr = c.class_fractions(clc, laea_km_grid())
+    np.testing.assert_allclose(fr["fraction"].sum("clc_class"), 1.0, atol=1e-5)
+    cov = fr["coverage"].values
+    np.testing.assert_allclose(cov[0], 0.9, atol=1e-6)  # one nodata CLC row
+    np.testing.assert_allclose(cov[1:], 1.0, atol=1e-6)
+
+
+def test_dominant_class_assigns_codes_to_coarse_pixels(clc):
+    fr = c.class_fractions(clc, laea_km_grid())
+    dom = fr["dominant_class"].values
+    centre = N // B // 2
+    assert dom[centre, centre] == 111
+    assert dom[centre, -1] == 311
+    assert dom[centre, 0] == 211
+    # dominant class agrees with the point lookup at the block centre
+    x, y = float(fr.x[0]), float(fr.y[centre])
+    assert dom[centre, 0] == c.clc_at(clc, x, y, crs=c.CORINE_CRS)
+
+
+def test_class_fractions_selected_and_absent_classes(clc):
+    fr = c.class_fractions(clc, laea_km_grid(), classes=(311, 512))
+    assert list(fr["clc_class"].values) == [311, 512]
+    assert list(fr["clc_name"].values) == ["Broad-leaved forest", "Water bodies"]
+    np.testing.assert_allclose(fr["fraction"].sel(clc_class=512), 0.0)
+    # dominant class still considers all classes
+    assert fr["dominant_class"].values[N // B // 2, N // B // 2] == 111
+    with pytest.raises(ValueError, match="999"):
+        c.class_fractions(clc, laea_km_grid(), classes=(999,))
+
+
+def test_class_fractions_on_modis_sinusoidal_grid(clc):
+    target = modis_grid()
+    fr = c.class_fractions(clc, target)
+    assert "+proj=sinu" in fr.attrs["crs"]
+    # cropped to the CLC window, coordinates are a subset of the target
+    assert fr.sizes["x"] < target.sizes["x"] and fr.sizes["y"] < target.sizes["y"]
+    assert np.isin(fr.x.values, target.x.values).all()
+    assert np.isin(fr.y.values, target.y.values).all()
+
+    full = fr["coverage"].values > 0.999
+    np.testing.assert_allclose(
+        fr["fraction"].sum("clc_class").values[full], 1.0, atol=1e-4)
+
+    # class areas are preserved: sum(fraction * coverage * pixel area)
+    pix_area = MODIS_PX ** 2
+    for code in (111, 211, 311):
+        f = fr["fraction"].sel(clc_class=code).fillna(0) * fr["coverage"]
+        area_modis = float(f.sum()) * pix_area
+        area_clc = float((clc.values == code).sum()) * RES ** 2
+        assert area_modis == pytest.approx(area_clc, rel=0.01)
+
+    sx, sy = Transformer.from_crs("EPSG:4326", fr.attrs["crs"], always_xy=True) \
+        .transform(*c.KRAKOW_CENTRE)
+    at_centre = fr.sel(x=sx, y=sy, method="nearest")
+    assert float(at_centre["fraction"].sel(clc_class=111)) > 0.99
+    assert int(at_centre["dominant_class"]) == 111
+
+
+def test_class_fractions_uncropped_keeps_target_grid(clc):
+    target = modis_grid(half_size_px=30)
+    fr = c.class_fractions(clc, target, crop=False)
+    assert fr.sizes["x"] == target.sizes["x"]
+    outside = fr["coverage"].values == 0
+    assert outside.any()
+    assert np.isnan(fr["fraction"].values[:, outside]).all()
+    assert (fr["dominant_class"].values[outside] == c.CLC_NODATA).all()
+
+
+def test_class_fractions_no_overlap_raises(clc):
+    far = xr.Dataset(coords={"x": [0.0, 1000.0], "y": [1000.0, 0.0]},
+                     attrs={"crs": c.CORINE_CRS})
+    with pytest.raises(ValueError, match="overlap"):
+        c.class_fractions(clc, far)
+
+
+def test_group_fractions(clc):
+    fr = c.class_fractions(clc, laea_km_grid())
+    g = c.group_fractions(fr)
+    assert set(g.data_vars) == {"urban_fraction", "forest_fraction",
+                                "arable_fraction", "coverage"}
+    expected = fr["fraction"].sel(clc_class=[111, 112, 121]).sum("clc_class")
+    np.testing.assert_allclose(g["urban_fraction"], expected)
+    total = g["urban_fraction"] + g["forest_fraction"] + g["arable_fraction"]
+    np.testing.assert_allclose(total, 1.0, atol=1e-5)
+    # a group of classes absent from the fractions is all zero
+    w = c.group_fractions(fr, {"water": (511, 512)})
+    np.testing.assert_allclose(w["water_fraction"], 0.0)
+
+
+def test_mask_fraction_aligned(clc):
+    urban = c.urban_core_mask(clc)
+    f = c.mask_fraction(urban, laea_km_grid())
+    assert f.name == "urban_fraction"
+    np.testing.assert_allclose(f.values, block_mean(urban.values), atol=1e-6)
+
+
+def test_modis_urban_rural_masks(clc_settl):
+    ds = c.modis_urban_rural_masks(clc_settl, modis_grid())
+    assert {"urban", "rural", "urban_fraction", "rural_fraction",
+            "coverage"} <= set(ds.data_vars)
+    urban, rural = ds["urban"].values, ds["rural"].values
+    assert urban.dtype == bool and urban.any() and rural.any()
+    assert not (urban & rural).any()
+    assert (ds["urban_fraction"].values[urban] >= 0.5).all()
+    assert (ds["rural_fraction"].values[rural] >= 0.75).all()
+    assert (ds["coverage"].values[urban | rural] >= 0.9).all()
+    # the MODIS pixel at the city centre is urban
+    sx, sy = Transformer.from_crs("EPSG:4326", ds.attrs["crs"], always_xy=True) \
+        .transform(*c.KRAKOW_CENTRE)
+    assert bool(ds["urban"].sel(x=sx, y=sy, method="nearest"))
+
+
+def test_modis_urban_rural_masks_thresholds(clc_settl):
+    masks = c.urban_rural_masks(clc_settl)
+    loose = c.modis_urban_rural_masks(clc_settl, modis_grid(), masks=masks,
+                                      urban_threshold=0.1, rural_threshold=0.3)
+    strict = c.modis_urban_rural_masks(clc_settl, modis_grid(), masks=masks,
+                                       urban_threshold=0.9, rural_threshold=0.95)
+    assert loose["urban"].sum() > strict["urban"].sum()
+    assert loose["rural"].sum() > strict["rural"].sum()

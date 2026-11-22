@@ -598,3 +598,272 @@ def urban_rural_masks(
     })
     ds.attrs = {k: v for k, v in clc.attrs.items() if k != "nodata"}
     return ds
+
+
+# ---------------------------------------------------------------------------
+# Aggregation to the 1 km MODIS grid
+# ---------------------------------------------------------------------------
+# A MODIS LST pixel (~926 m, sinusoidal) contains ~86 CLC pixels (100 m,
+# LAEA). Each CLC class is turned into a 0/1 layer and warped onto the MODIS
+# grid with GDAL's area-weighted ``average`` resampling, which gives the
+# fraction of the MODIS pixel covered by that class (relative to its valid
+# CLC area). Both CRSs are equal-area, so shares of the *whole* MODIS pixel
+# (``coverage``, mask fractions) follow from area-weighted sums.
+
+DEFAULT_URBAN_FRACTION = 0.5   # MODIS pixel is "urban" from this share
+DEFAULT_RURAL_FRACTION = 0.75  # MODIS pixel is "rural" from this share
+DEFAULT_MIN_COVERAGE = 0.9     # required share of valid CLC data per pixel
+
+
+def clc_bounds(grid: xr.DataArray) -> BoundingBox:
+    """Outer bounds ``(left, bottom, right, top)`` of a pixel-centre grid."""
+    t = _transform_from_coords(grid)
+    ny, nx = grid.shape[-2:]
+    xs = (t.c, t.c + t.a * nx)
+    ys = (t.f, t.f + t.e * ny)
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _resolve_target(target, src: xr.DataArray, target_crs: str | None,
+                    crop: bool, margin: int = 1):
+    """Coordinates, transform and CRS of the target grid.
+
+    With ``crop`` the grid is reduced to the pixels overlapping ``src``
+    (plus ``margin`` pixels); coordinates stay identical to the target's.
+    """
+    from modis_processing import MODIS_SINUSOIDAL_PROJ4
+    from rasterio.transform import Affine
+
+    crs = target_crs or target.attrs.get("crs") or MODIS_SINUSOIDAL_PROJ4
+    x, y = target["x"].values, target["y"].values
+    if len(x) < 2 or len(y) < 2:
+        raise ValueError("Target grid needs at least 2 pixels along x and y")
+    dx, dy = x[1] - x[0], y[1] - y[0]
+
+    if crop:
+        x0, y0, x1, y1 = _bbox_to_crs(clc_bounds(src), crs, src.attrs["crs"])
+        mx, my = margin * abs(dx), margin * abs(dy)
+        ix = np.flatnonzero((x >= x0 - mx) & (x <= x1 + mx))
+        iy = np.flatnonzero((y >= y0 - my) & (y <= y1 + my))
+        if ix.size == 0 or iy.size == 0:
+            raise ValueError("Target grid does not overlap the CLC window")
+        x, y = x[ix[0]:ix[-1] + 1], y[iy[0]:iy[-1] + 1]
+
+    transform = Affine(dx, 0.0, x[0] - dx / 2, 0.0, dy, y[0] - dy / 2)
+    return x, y, transform, crs
+
+
+def _warp(stack: np.ndarray, src: xr.DataArray, x, y, transform, crs,
+          resampling, src_nodata=np.nan) -> np.ndarray:
+    """Warp a ``(band, y, x)`` float stack from the CLC grid to a target."""
+    from rasterio.warp import reproject
+
+    dst = np.full((stack.shape[0], len(y), len(x)), np.nan, np.float32)
+    reproject(
+        source=stack, destination=dst,
+        src_transform=_transform_from_coords(src), src_crs=src.attrs["crs"],
+        src_nodata=src_nodata,
+        dst_transform=transform, dst_crs=crs, dst_nodata=np.nan,
+        resampling=resampling,
+    )
+    return dst
+
+
+def _area_share(values: np.ndarray, src: xr.DataArray, x, y, transform, crs):
+    """Share of each target pixel's area covered by True ``values``."""
+    from rasterio.enums import Resampling
+
+    summed = _warp(np.asarray(values, np.float32)[None], src, x, y,
+                   transform, crs, Resampling.sum, src_nodata=None)[0]
+    ratio = abs(_transform_from_coords(src).determinant) / abs(transform.determinant)
+    return np.clip(np.nan_to_num(summed) * ratio, 0, 1).astype(np.float32)
+
+
+def _grid_dataarray(values, x, y, name, crs, **attrs) -> xr.DataArray:
+    return xr.DataArray(values, dims=("y", "x"), coords={"x": x, "y": y},
+                        name=name, attrs={"crs": crs, **attrs})
+
+
+def mask_fraction(
+    mask: xr.DataArray,
+    target,
+    target_crs: str | None = None,
+    crop: bool = True,
+) -> xr.DataArray:
+    """Share (0..1) of each target pixel covered by a fine boolean mask.
+
+    Used to bring 100 m masks (urban core, rural reference, valid data)
+    onto the MODIS grid; the share refers to the full target pixel area.
+    """
+    x, y, transform, crs = _resolve_target(target, mask, target_crs, crop)
+    share = _area_share(mask.values, mask, x, y, transform, crs)
+    return _grid_dataarray(share, x, y, f"{mask.name or 'mask'}_fraction",
+                           crs, units="1")
+
+
+def coverage_fraction(
+    clc: xr.DataArray,
+    target,
+    target_crs: str | None = None,
+    crop: bool = True,
+) -> xr.DataArray:
+    """Share (0..1) of each target pixel covered by valid CLC data."""
+    cover = mask_fraction(valid_mask(clc), target, target_crs, crop)
+    cover.attrs["long_name"] = "valid CLC area fraction"
+    return cover.rename("coverage")
+
+
+def class_fractions(
+    clc: xr.DataArray,
+    target,
+    classes: tuple[int, ...] | None = None,
+    target_crs: str | None = None,
+    crop: bool = True,
+) -> xr.Dataset:
+    """Fraction of every CLC class inside each pixel of a coarser grid.
+
+    Parameters
+    ----------
+    clc:
+        CLC code raster (100 m).
+    target:
+        Dataset/DataArray defining the coarse grid through pixel-centre
+        ``x``/``y`` coordinates, e.g. the processed MODIS LST dataset.
+    classes:
+        CLC codes to report; default: all classes present in ``clc``.
+    target_crs:
+        CRS of the target grid; default ``target.attrs["crs"]`` or the
+        MODIS sinusoidal projection.
+    crop:
+        Restrict the output to target pixels overlapping the CLC window
+        (coordinates stay identical to the target, so it aligns with it).
+
+    Returns
+    -------
+    Dataset with
+
+    * ``fraction`` ``(clc_class, y, x)`` - share of the valid CLC area per
+      class (all present classes sum to 1; NaN without CLC data),
+    * ``dominant_class`` ``(y, x)`` - CLC code with the largest share
+      (``CLC_NODATA`` without CLC data),
+    * ``coverage`` ``(y, x)`` - share of the pixel with valid CLC data.
+    """
+    from rasterio.enums import Resampling
+
+    present = [int(k) for k in np.unique(clc.values) if k != CLC_NODATA]
+    classes = tuple(present if classes is None else (int(k) for k in classes))
+    unknown = [k for k in classes if k not in CLC_CLASSES]
+    if unknown:
+        raise ValueError(f"Unknown CLC codes: {unknown}")
+
+    x, y, transform, crs = _resolve_target(target, clc, target_crs, crop)
+
+    # warp all present classes once (needed for the dominant class) plus
+    # requested classes that do not occur (they get fraction 0)
+    codes = sorted(set(present) | set(classes))
+    nodata = clc.values == CLC_NODATA
+    stack = np.empty((len(codes),) + clc.shape, np.float32)
+    for i, code in enumerate(codes):
+        stack[i] = clc.values == code
+    stack[:, nodata] = np.nan
+    frac_all = _warp(stack, clc, x, y, transform, crs, Resampling.average)
+
+    has_data = np.isfinite(frac_all).any(axis=0)
+    dominant = np.full((len(y), len(x)), CLC_NODATA, np.uint16)
+    if present:
+        idx_present = [codes.index(k) for k in present]
+        sub = np.nan_to_num(frac_all[idx_present], nan=-1.0)
+        best = np.asarray(present, np.uint16)[sub.argmax(axis=0)]
+        dominant[has_data] = best[has_data]
+
+    frac = frac_all[[codes.index(k) for k in classes]]
+    ds = xr.Dataset(
+        {
+            "fraction": (("clc_class", "y", "x"), frac,
+                         {"units": "1",
+                          "long_name": "share of valid CLC area per class"}),
+            "dominant_class": (("y", "x"), dominant,
+                               {"long_name": "CLC class with largest share",
+                                "nodata": CLC_NODATA}),
+        },
+        coords={"clc_class": list(classes), "x": x, "y": y,
+                "clc_name": ("clc_class", [clc_name(k) for k in classes])},
+        attrs={"crs": crs, "source_resolution_m": clc.attrs.get("res"),
+               "source_file": clc.attrs.get("source_file", "")},
+    )
+    ds["coverage"] = coverage_fraction(clc, ds, target_crs=crs, crop=False)
+    return ds
+
+
+def group_fractions(
+    fractions: xr.Dataset,
+    groups: dict[str, tuple[int, ...]] | None = None,
+) -> xr.Dataset:
+    """Sum class fractions into groups (default: urban / forest / arable).
+
+    ``fractions`` is the output of :func:`class_fractions`; classes of a
+    group that are not in it count as 0. Variables are ``<group>_fraction``.
+    """
+    groups = CLASS_GROUPS if groups is None else groups
+    frac = fractions["fraction"]
+    available = set(int(k) for k in frac["clc_class"].values)
+    empty = xr.zeros_like(frac.isel(clc_class=0, drop=True)).where(
+        frac.isel(clc_class=0, drop=True).notnull())
+    out = {}
+    for name, codes in groups.items():
+        sel = [k for k in codes if k in available]
+        g = frac.sel(clc_class=sel).sum("clc_class", skipna=False) if sel else empty
+        g = g.drop_vars("clc_name", errors="ignore")
+        g.attrs = {"units": "1", "clc_codes": list(codes)}
+        out[f"{name}_fraction"] = g
+    ds = xr.Dataset(out, attrs=fractions.attrs)
+    if "coverage" in fractions:
+        ds["coverage"] = fractions["coverage"]
+    return ds
+
+
+def modis_urban_rural_masks(
+    clc: xr.DataArray,
+    target,
+    masks: xr.Dataset | None = None,
+    urban_threshold: float = DEFAULT_URBAN_FRACTION,
+    rural_threshold: float = DEFAULT_RURAL_FRACTION,
+    min_coverage: float = DEFAULT_MIN_COVERAGE,
+    target_crs: str | None = None,
+    crop: bool = True,
+    **mask_kwargs,
+) -> xr.Dataset:
+    """Binary urban / rural masks on the coarse (MODIS) grid.
+
+    A target pixel is ``urban`` if at least ``urban_threshold`` of its area
+    lies in the 100 m urban core, and ``rural`` if at least
+    ``rural_threshold`` lies in the rural reference mask. Pixels with less
+    than ``min_coverage`` valid CLC data are neither.
+
+    ``masks`` is the output of :func:`urban_rural_masks`; it is computed
+    from ``clc`` (passing ``mask_kwargs``) if not given.
+    """
+    if masks is None:
+        masks = urban_rural_masks(clc, **mask_kwargs)
+    kw = dict(target_crs=target_crs, crop=crop)
+    urban_f = mask_fraction(masks["urban"], target, **kw)
+    rural_f = mask_fraction(masks["rural"], target, **kw)
+    cover = coverage_fraction(clc, target, **kw)
+
+    ok = cover.values >= min_coverage
+    urban = ok & (urban_f.values >= urban_threshold)
+    rural = ok & (rural_f.values >= rural_threshold) & ~urban
+    crs = urban_f.attrs["crs"]
+    x, y = urban_f.x.values, urban_f.y.values
+    return xr.Dataset(
+        {
+            "urban": _grid_dataarray(urban, x, y, "urban", crs,
+                                     threshold=urban_threshold),
+            "rural": _grid_dataarray(rural, x, y, "rural", crs,
+                                     threshold=rural_threshold),
+            "urban_fraction": urban_f,
+            "rural_fraction": rural_f,
+            "coverage": cover,
+        },
+        attrs={"crs": crs, "min_coverage": min_coverage},
+    )
