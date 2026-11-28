@@ -13,6 +13,14 @@ REQUIRED_BANDS = ("ST_B10", "SR_B4", "SR_B5", "SR_B6", "QA_PIXEL")
 # fill, dilated cloud, cirrus, cloud, cloud shadow, and snow.
 QA_PIXEL_REJECT_BITS = 0b00111111
 
+ST_B10_SCALE_K = 0.00341802
+ST_B10_OFFSET_K = 149.0
+KELVIN_TO_CELSIUS_OFFSET = 273.15
+
+SR_SCALE = 0.0000275
+SR_OFFSET = -0.2
+
+MIN_INDEX_DENOMINATOR = 1e-6
 
 def discover_scenes(raw_dir: str | Path) -> dict[str, dict[str, Path]]:
     """Return required GeoTIFF paths grouped by full Landsat scene ID."""
@@ -123,3 +131,57 @@ def read_masked_window(bands: dict[str, Path], window: Window) -> xr.Dataset:
         ds[band] = (("y", "x"), values, {"units": "DN"})
 
     return ds
+
+def st_b10_to_celsius(st_b10_dn: xr.DataArray) -> xr.DataArray:
+    """Convert QA-masked Landsat Collection 2 ST_B10 DN to degrees Celsius."""
+    temperature_k = st_b10_dn.astype(np.float64) * ST_B10_SCALE_K + ST_B10_OFFSET_K
+    lst = (temperature_k - KELVIN_TO_CELSIUS_OFFSET).rename("lst")
+    lst.attrs = {"units": "degC", "long_name": "land surface temperature"}
+    return lst
+
+def sr_dn_to_reflectance(sr_dn: xr.DataArray) -> xr.DataArray:
+    """Scale QA-masked Landsat Collection 2 surface-reflectance DN."""
+    reflectance = sr_dn.astype(np.float64) * SR_SCALE + SR_OFFSET
+    reflectance.attrs = {"units": "1", "long_name": "surface reflectance"}
+    return reflectance
+
+def _normalized_difference(
+    first: xr.DataArray, second: xr.DataArray
+) -> xr.DataArray:
+    """Return a normalized difference for eligible reflectance pairs."""
+    denominator = first + second
+    valid = (
+        np.isfinite(first)
+        & np.isfinite(second)
+        & (first >= 0.0)
+        & (second >= 0.0)
+        & (denominator > MIN_INDEX_DENOMINATOR)
+    )
+    return (first - second).where(valid) / denominator.where(valid)
+
+
+def landsat_indices(dn: xr.Dataset) -> xr.Dataset:
+    """Compute NDVI and NDBI from QA-masked Landsat reflectance DN."""
+    red = sr_dn_to_reflectance(dn["SR_B4"])
+    nir = sr_dn_to_reflectance(dn["SR_B5"])
+    swir1 = sr_dn_to_reflectance(dn["SR_B6"])
+
+    ndvi = _normalized_difference(nir, red)
+    ndvi.attrs = {
+        "units": "1",
+        "long_name": "normalized difference vegetation index",
+    }
+    ndbi = _normalized_difference(swir1, nir)
+    ndbi.attrs = {
+        "units": "1",
+        "long_name": "normalized difference built-up index",
+    }
+
+    return xr.Dataset({"ndvi": ndvi, "ndbi": ndbi}, attrs=dict(dn.attrs))
+
+def process_landsat_window(bands: dict[str, Path], window: Window) -> xr.Dataset:
+    """Return calibrated LST, NDVI, and NDBI on a native Landsat window."""
+    dn = read_masked_window(bands, window)
+    processed = landsat_indices(dn)
+    processed["lst"] = st_b10_to_celsius(dn["ST_B10"])
+    return processed
